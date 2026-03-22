@@ -7,6 +7,8 @@ import time
 import uuid
 from typing import Optional
 
+from app.services.grok.utils.usage import empty_chat_usage
+
 
 def make_response_id() -> str:
     """Generate a unique response ID."""
@@ -20,6 +22,7 @@ def make_chat_chunk(
     index: int = 0,
     role: str = "assistant",
     is_final: bool = False,
+    usage: Optional[dict] = None,
 ) -> dict:
     """
     Create an OpenAI-compatible chat completion chunk.
@@ -55,12 +58,7 @@ def make_chat_chunk(
     }
 
     if is_final:
-        chunk["usage"] = {
-            "total_tokens": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
-        }
+        chunk["usage"] = usage or empty_chat_usage()
 
     return chunk
 
@@ -89,12 +87,7 @@ def make_chat_response(
         response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
     if usage is None:
-        usage = {
-            "total_tokens": 0,
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "input_tokens_details": {"text_tokens": 0, "image_tokens": 0},
-        }
+        usage = empty_chat_usage()
 
     return {
         "id": response_id,

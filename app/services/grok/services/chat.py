@@ -26,6 +26,7 @@ from app.services.grok.utils.retry import pick_token, rate_limited, transient_up
 from app.services.reverse.app_chat import AppChatReverse
 from app.services.reverse.utils.session import ResettableSession
 from app.services.grok.utils.stream import wrap_stream_with_usage
+from app.services.grok.utils.usage import estimate_chat_usage
 from app.services.grok.utils.tool_call import (
     build_tool_prompt,
     parse_tool_calls,
@@ -373,7 +374,13 @@ class GrokChatService:
             model_config_override=model_config_override,
         )
 
-        return response, stream, model
+        usage_context = {
+            "prompt_text": message,
+            "prompt_image_count": len(image_attachments),
+            "prompt_file_count": len(file_attachments),
+        }
+
+        return response, stream, model, usage_context
 
 
 class ChatService:
@@ -426,7 +433,7 @@ class ChatService:
             try:
                 # 请求 Grok
                 service = GrokChatService()
-                response, _, model_name = await service.chat_openai(
+                response, _, model_name, usage_context = await service.chat_openai(
                     token,
                     model,
                     messages,
@@ -442,14 +449,31 @@ class ChatService:
                 # 处理响应
                 if is_stream:
                     logger.debug(f"Processing stream response: model={model}")
-                    processor = StreamProcessor(model_name, token, show_think, tools=tools, tool_choice=tool_choice)
+                    processor = StreamProcessor(
+                        model_name,
+                        token,
+                        show_think,
+                        prompt_text=usage_context["prompt_text"],
+                        prompt_image_count=usage_context["prompt_image_count"],
+                        prompt_file_count=usage_context["prompt_file_count"],
+                        tools=tools,
+                        tool_choice=tool_choice,
+                    )
                     return wrap_stream_with_usage(
                         processor.process(response), token_mgr, token, model
                     )
 
                 # 非流式
                 logger.debug(f"Processing non-stream response: model={model}")
-                result = await CollectProcessor(model_name, token, tools=tools, tool_choice=tool_choice).process(response)
+                result = await CollectProcessor(
+                    model_name,
+                    token,
+                    prompt_text=usage_context["prompt_text"],
+                    prompt_image_count=usage_context["prompt_image_count"],
+                    prompt_file_count=usage_context["prompt_file_count"],
+                    tools=tools,
+                    tool_choice=tool_choice,
+                ).process(response)
                 try:
                     model_info = ModelService.get(model)
                     effort = (
@@ -506,11 +530,24 @@ class ChatService:
 class StreamProcessor(proc_base.BaseProcessor):
     """Stream response processor."""
 
-    def __init__(self, model: str, token: str = "", show_think: bool = None, tools: List[Dict[str, Any]] = None, tool_choice: Any = None):
+    def __init__(
+        self,
+        model: str,
+        token: str = "",
+        show_think: bool = None,
+        prompt_text: str = "",
+        prompt_image_count: int = 0,
+        prompt_file_count: int = 0,
+        tools: List[Dict[str, Any]] = None,
+        tool_choice: Any = None,
+    ):
         super().__init__(model, token)
         self.response_id: str = None
         self.fingerprint: str = ""
         self.rollout_id: str = ""
+        self.prompt_text = prompt_text
+        self.prompt_image_count = prompt_image_count
+        self.prompt_file_count = prompt_file_count
         self.think_opened: bool = False
         self.think_closed_once: bool = False
         self.image_think_active: bool = False
@@ -531,6 +568,8 @@ class StreamProcessor(proc_base.BaseProcessor):
         self._tool_partial = ""
         self._tool_calls_seen = False
         self._tool_call_index = 0
+        self._usage_text_parts: List[str] = []
+        self._usage_tool_calls: List[Any] = []
 
     def _with_tool_index(self, tool_call: Any) -> Any:
         if not isinstance(tool_call, dict):
@@ -691,7 +730,14 @@ class StreamProcessor(proc_base.BaseProcessor):
         self._tool_state = "text"
         return events
 
-    def _sse(self, content: str = "", role: str = None, finish: str = None, tool_calls: list = None) -> str:
+    def _sse(
+        self,
+        content: str = "",
+        role: str = None,
+        finish: str = None,
+        tool_calls: list = None,
+        usage: Dict[str, Any] = None,
+    ) -> str:
         """Build SSE response."""
         delta = {}
         if role:
@@ -712,7 +758,22 @@ class StreamProcessor(proc_base.BaseProcessor):
                 {"index": 0, "delta": delta, "logprobs": None, "finish_reason": finish}
             ],
         }
+        if tool_calls is not None:
+            self._usage_tool_calls.extend(tool_calls)
+        elif content:
+            self._usage_text_parts.append(content)
+        if usage is not None:
+            chunk["usage"] = usage
         return f"data: {orjson.dumps(chunk).decode()}\n\n"
+
+    def _build_usage(self) -> Dict[str, Any]:
+        return estimate_chat_usage(
+            prompt_text=self.prompt_text,
+            completion_text="".join(self._usage_text_parts),
+            prompt_image_count=self.prompt_image_count,
+            prompt_file_count=self.prompt_file_count,
+            completion_tool_calls=self._usage_tool_calls,
+        )
 
     async def process(self, response: AsyncIterable[bytes]) -> AsyncGenerator[str, None]:
         """Process stream response.
@@ -858,9 +919,9 @@ class StreamProcessor(proc_base.BaseProcessor):
                     elif kind == "tool":
                         yield self._sse(tool_calls=[payload])
                 finish_reason = "tool_calls" if self._tool_calls_seen else "stop"
-                yield self._sse(finish=finish_reason)
+                yield self._sse(finish=finish_reason, usage=self._build_usage())
             else:
-                yield self._sse(finish="stop")
+                yield self._sse(finish="stop", usage=self._build_usage())
 
             yield "data: [DONE]\n\n"
         except asyncio.CancelledError:
@@ -902,8 +963,20 @@ class StreamProcessor(proc_base.BaseProcessor):
 class CollectProcessor(proc_base.BaseProcessor):
     """Non-stream response processor."""
 
-    def __init__(self, model: str, token: str = "", tools: List[Dict[str, Any]] = None, tool_choice: Any = None):
+    def __init__(
+        self,
+        model: str,
+        token: str = "",
+        prompt_text: str = "",
+        prompt_image_count: int = 0,
+        prompt_file_count: int = 0,
+        tools: List[Dict[str, Any]] = None,
+        tool_choice: Any = None,
+    ):
         super().__init__(model, token)
+        self.prompt_text = prompt_text
+        self.prompt_image_count = prompt_image_count
+        self.prompt_file_count = prompt_file_count
         self.filter_tags = get_config("app.filter_tags")
         self.tools = tools
         self.tool_choice = tool_choice
@@ -1085,6 +1158,14 @@ class CollectProcessor(proc_base.BaseProcessor):
         if tool_calls_result:
             message_obj["tool_calls"] = tool_calls_result
 
+        usage = estimate_chat_usage(
+            prompt_text=self.prompt_text,
+            completion_text=content or "",
+            prompt_image_count=self.prompt_image_count,
+            prompt_file_count=self.prompt_file_count,
+            completion_tool_calls=tool_calls_result,
+        )
+
         return {
             "id": response_id,
             "object": "chat.completion",
@@ -1098,22 +1179,7 @@ class CollectProcessor(proc_base.BaseProcessor):
                     "finish_reason": finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "prompt_tokens_details": {
-                    "cached_tokens": 0,
-                    "text_tokens": 0,
-                    "audio_tokens": 0,
-                    "image_tokens": 0,
-                },
-                "completion_tokens_details": {
-                    "text_tokens": 0,
-                    "audio_tokens": 0,
-                    "reasoning_tokens": 0,
-                },
-            },
+            "usage": usage,
         }
 
 
